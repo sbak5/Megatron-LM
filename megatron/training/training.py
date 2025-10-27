@@ -2325,6 +2325,9 @@ def train(
             if args.log_energy:
                 energy_monitor.resume()
 
+            clear_aux_losses_tracker()
+
+
         # Miscellaneous post-training-step functions (e.g., FT heartbeats, GC).
         # Some of these only happen at specific iterations.
         post_training_step_callbacks(
