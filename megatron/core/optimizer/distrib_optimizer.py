@@ -1546,7 +1546,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         communication or intermediate buffers/copies.
 
         Stores optimizer state in the format that corresponds to the internal Distributed
-        Optimizer format, i.e. in buckets. Each buckets consists of state parameters and
+        Optimizer format, i.e. in buckets. Each bucket consists of state parameters and
         potentially some padding:
         - intra-param padding
         - param 1
@@ -1598,6 +1598,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     assert gbuf_world_numel % data_parallel_world_size == 0
                     gbuf_local_numel = gbuf_world_numel // data_parallel_world_size
 
+                    if dtype[1] == torch.bfloat16:
+                        old_dtype = dtype
+                        dtype = (dtype[0], torch.float32)
+                        if torch.distributed.get_rank() == 0:
+                            logger.info(
+                                f"Changing dtype from {old_dtype} to {dtype} in sharded_bucket_key "
+                                "to support checkpoint compatibility when changing grad_dtype..."
+                            )
                     sharded_bucket_key = (
                         f'optimizer.distributed.dp_group_idx_{self.data_parallel_group_idx}'
                         f'.gbuf_idx_{gbuf_idx}.dtype_{dtype}.bucket_idx_{bucket_idx}'
@@ -1769,6 +1777,25 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         """
         if state_dict is not None and "per_bucket_numel_unpadded" in state_dict:
             per_bucket_numel_unpadded_in_checkpoint = state_dict["per_bucket_numel_unpadded"]
+
+            # Check if we need to re-map keys (canonicalize to grad.dtype=torch.float32).
+            new_key = (torch.bfloat16, torch.float32)
+            old_key = (torch.bfloat16, torch.bfloat16)
+
+            for (per_bucket_numel_unpadded, description_str) in zip(
+                [self.per_bucket_numel_unpadded, per_bucket_numel_unpadded_in_checkpoint],
+                ["internal DistOpt data structure", "loaded state_dict"]
+            ):
+                # Iterate over list of dicts.
+                for bucket_dict in per_bucket_numel_unpadded:
+                    if old_key in bucket_dict:
+                        bucket_dict[new_key] = bucket_dict.pop(old_key)
+                        if torch.distributed.get_rank() == 0:
+                            logger.info(
+                                f"Re-mapped grad_dtype from {old_key} to {new_key} in "
+                                f"{description_str} to support loading checkpoint..."
+                            )
+
             assert self.per_bucket_numel_unpadded == per_bucket_numel_unpadded_in_checkpoint, (
                 f"Number of unpadded elements in each bucket need to be the same in current run "
                 f"({self.per_bucket_numel_unpadded}) and checkpoint "
