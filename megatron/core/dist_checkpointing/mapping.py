@@ -152,10 +152,11 @@ class ShardedTensor(ShardedBase):
 
         if self.flattened_range is not None:
             if not _logged_deprecations.get("flattened_range", False):
-                logger.warning(
-                    "ShardedTensor.flattened_range is deprecated."
-                    " Use latest DistributedOptimizer formats."
-                )
+                if torch.distributed.get_rank() == 0:
+                    logger.warning(
+                        "ShardedTensor.flattened_range is deprecated."
+                        " Use latest DistributedOptimizer formats."
+                     )
                 _logged_deprecations["flattened_range"] = True
 
     @property

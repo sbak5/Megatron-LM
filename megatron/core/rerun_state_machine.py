@@ -1057,7 +1057,8 @@ class RerunStateMachine:
                             if len(iterations_seen_by_job[job][iteration]) > 1:
                                 iterations_to_ignore.add(iteration)
         except Exception as e:
-            logger.error(f"Could not parse iterations to skip in tracker file! ({e})")
+            if _safe_get_rank() == 0:
+                logger.error(f"Could not parse iterations to skip in tracker file! ({e})")
         iterations_to_skip = sorted(iterations_to_potentially_skip - iterations_to_ignore)
         if _safe_get_rank() == 0:
             logger.warning(f"Will skip these iterations from tracker file: {iterations_to_skip}")
