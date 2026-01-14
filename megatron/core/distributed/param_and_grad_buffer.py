@@ -366,6 +366,11 @@ class _ParamAndGradBucketGroup:
         communication call. When ddp_config.overlap_grad_reduce is set to False, makes
         synchronous call.
         """
+        if self.is_first_batch and self.grad_reduce_handle is not None:
+            # Make this start_grad_sync call a no-op if in first batch and collective has
+            # already been dispatched.
+            return
+
         assert (
             self.grad_reduce_handle is None
         ), "Should not have multiple communication calls outstanding at once"
@@ -475,7 +480,7 @@ class _ParamAndGradBucketGroup:
                     )
 
         if async_op:
-            if self.ddp_config.reduce_scatter_with_fp32_accumulation:
+            if self.ddp_config.reduce_scatter_with_fp32_accumulation and not force_all_reduce:
                 assert (
                     len(self.buckets) == 1
                 ), "Only 1 bucket supported with reduce_scatter_with_fp32_accumulation=True"
@@ -511,7 +516,7 @@ class _ParamAndGradBucketGroup:
         # asynchronous communication only once self.golden_per_param_grad_ready_counts is
         # populated at the end of this first batch.
         if self.is_first_batch:
-            self.start_grad_sync()
+            self.start_grad_sync(force_all_reduce=force_all_reduce)
         # When using multiple DistOpt instances, we don't need to sync here as we launch
         # communications on a separate communication stream.
         if self.ddp_config.num_distributed_optimizer_instances > 1:

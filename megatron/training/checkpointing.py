@@ -397,35 +397,24 @@ def _build_sharded_state_dict_metadata(args: Namespace) -> dict:
     return metadata
 
 
-def save_main_grads(model, iteration):
+def save_grads(state_dict, iteration, grad_label):
     args = get_args()
 
-    # Collect main_grads into a state_dict that is then persisted to disk. Do this collection
-    # before the main_grads are cleared but after they are reduced.
+    # Persist state_dict of grads onto disk. In case of wgrads, this collection should be
+    # performed before the grads are cleared but after they are reduced.
     # NOTE: Non-expert layers will be duplicated, but this can be handled in postprocessing.
 
-    print_rank_0(f"  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}] saving main_grads "
+    print_rank_0(f"  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}] saving {grad_label} "
                  f"from iteration {iteration:7d}")
 
-    # Collect state_dict of .main_grads.
-    state_dict = {}
     if mpu.get_expert_data_parallel_rank() == 0:
-        for model_chunk_id, model_chunk in enumerate(model):
-            model_chunk_name = f"model_chunk{model_chunk_id}"
-            state_dict[model_chunk_name] = {}
-            unwrapped_model_chunk = unwrap_model(model_chunk)
-            for param_name, param in unwrapped_model_chunk.named_parameters():
-                if getattr(param, "main_grad", None) is not None:
-                    main_grad_on_cpu = param.main_grad.cpu()
-                    state_dict[model_chunk_name][param_name] = main_grad_on_cpu
-
         # Create saving directory.
         ep_rank = mpu.get_expert_model_parallel_rank()
         pp_rank = mpu.get_pipeline_model_parallel_rank()
         tp_rank = mpu.get_tensor_model_parallel_rank()
         assert args.save is not None
         assert iteration is not None
-        save_dir = os.path.join(args.save, "main_grads", f"iter_{iteration:07d}")
+        save_dir = os.path.join(args.save, grad_label, f"iter_{iteration:07d}")
         os.makedirs(save_dir, exist_ok=True)
 
         # Save state_dict.
@@ -437,7 +426,7 @@ def save_main_grads(model, iteration):
         full_save_path = os.path.join(save_dir, f"{checkpoint_name}.pth")
         torch.save(state_dict, full_save_path)
 
-    print_rank_0(f"  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}] saved main_grads "
+    print_rank_0(f"  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}] saved {grad_label} "
                  f"from iteration {iteration:7d}")
 
 
