@@ -80,9 +80,6 @@ def initialize_megatron(
         )
         load_args_from_checkpoint(args)
 
-    if args.async_save and args.use_persistent_ckpt_worker:
-        init_persistent_async_worker()
-
     if args.yaml_cfg is not None:
         args = validate_yaml(args, args_defaults)
     else:
@@ -94,6 +91,9 @@ def initialize_megatron(
 
     # set logging level
     setup_logging()
+
+    if args.async_save and args.use_persistent_ckpt_worker:
+        init_persistent_async_worker(args.rank, 'forkserver')
 
     # init rerun state
     def state_save_func():
