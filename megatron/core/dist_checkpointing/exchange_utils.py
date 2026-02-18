@@ -124,6 +124,7 @@ def distribute_shards_to_ranks(
     num_ranks: int,
     cross_parallelization_group_loads: Set[T],
     shard_to_source_rank: Optional[Dict[T, int]] = None,
+    shard_to_main_rank: Optional[Dict[T, int]] = None,
 ) -> Dict[T, int]:
     """Computes uniform distribution of workload across ranks, based on sizes.
 
@@ -139,12 +140,13 @@ def distribute_shards_to_ranks(
     Last step is added because we rely on the fact that
     the assignment is deterministic on all ranks.
 
-    When ``shard_to_source_rank`` is provided (load path), shards are first grouped
-    by their source rank (the local rank whose checkpoint file they originate from).
-    Each file-group is assigned as a unit to the source rank itself (if it is a valid
-    candidate), which ensures each rank loads only from its own file.  Only shards that
-    cannot be grouped (no source info, or the source rank is not valid) fall through
-    to the per-shard greedy algorithm.
+    When ``shard_to_source_rank`` is provided (load path), each loading rank should
+    try to load from a single file (the one with tensors it owns), then restore
+    others via exchange.  Shards are grouped by source file and each file-group
+    is assigned as a unit to the rank that owns that file (if valid), so each
+    rank reads from as few files as possible.  Shards that cannot be grouped
+    (no source info, or no single rank can take the whole file) fall through to
+    the per-shard greedy algorithm.
 
     Args:
         shard_to_ranks (Dict[T, List[int]]): mapping of rank access to shards
@@ -155,6 +157,10 @@ def distribute_shards_to_ranks(
             (local rank in the parallelization group whose checkpoint file contains
             this shard).  When provided, the algorithm groups shards by source rank
             and preferentially assigns each group to that rank.
+        shard_to_main_rank (Dict[T, int], optional): when provided (load path with
+            ignore_groups), restricts file-group assignment to ranks that own
+            (have main replica for) at least one shard in that file, so each rank
+            only loads from files that contain its owned tensors.
 
     Returns (Dict[T, int]): assignment of shard to rank (which rank should do the work
         to achieve maximal uniformity)
@@ -164,8 +170,8 @@ def distribute_shards_to_ranks(
     rank_sizes = [(0, rank) for rank in range(num_ranks)]
 
     # --- File-locality-aware grouping (load path) ---
-    # When source-rank hints are available, assign whole file-groups at once so
-    # each loading rank opens as few checkpoint files as possible.
+    # Each rank tries to load from a single file (tensors it "owns"), then restore
+    # others via exchange.  Assign whole file-groups to the owning rank when valid.
     ungrouped_shards: Dict[T, tuple] = {}
     if shard_to_source_rank:
         source_groups: Dict[int, List[T]] = defaultdict(list)
@@ -187,20 +193,48 @@ def distribute_shards_to_ranks(
             for shard_id in shards:
                 ranks_set = set(shard_to_ranks[shard_id])
                 valid_ranks = ranks_set if valid_ranks is None else valid_ranks & ranks_set
+            # When loading with ignore_groups, restrict to ranks that own (main replica)
+            # at least one shard in this file, so each rank loads only from files with its tensors.
+            file_owner_ranks = None
+            if shard_to_main_rank:
+                file_owner_ranks = {
+                    shard_to_main_rank[s] for s in shards if s in shard_to_main_rank
+                }
+                if file_owner_ranks and valid_ranks:
+                    valid_ranks = valid_ranks & file_owner_ranks
             if valid_ranks:
-                # Prefer the source rank (so this rank reads from its own file).
+                # Assign the whole file-group to one rank (needs every shard + owns one).
                 if source in valid_ranks:
                     rank = source
                 else:
-                    # Fall back to least-loaded valid rank.
                     _, rank = min(
                         (sz, r) for sz, r in rank_sizes if r in valid_ranks
                     )
                 for shard_id in shards:
                     shard_to_saving_rank[shard_id] = rank
                 rank_sizes[rank] = (rank_sizes[rank][0] + group_total, rank)
+            elif file_owner_ranks:
+                # No single rank needs every shard, but we know which ranks own tensors
+                # in this file.  Assign each shard to a rank that both *needs* it and
+                # *owns* at least one shard in this file, so that rank is already opening
+                # this file for its own tensor.  This avoids the per-shard greedy path
+                # which would scatter reads across many files.
+                for shard_id in shards:
+                    shard_ranks = set(shard_to_ranks[shard_id])
+                    preferred = shard_ranks & file_owner_ranks
+                    if preferred:
+                        _, rank = min(
+                            (sz, r) for sz, r in rank_sizes if r in preferred
+                        )
+                    else:
+                        # No owner needs this shard — fall back to any rank that needs it.
+                        _, rank = min(
+                            (sz, r) for sz, r in rank_sizes if r in shard_ranks
+                        )
+                    shard_to_saving_rank[shard_id] = rank
+                    rank_sizes[rank] = (rank_sizes[rank][0] + shard_to_size.get(shard_id, 0), rank)
             else:
-                # Cannot assign whole group to one rank -- fall through to per-shard greedy.
+                # No ownership info — fall through to per-shard greedy.
                 for shard_id in shards:
                     ungrouped_shards[shard_id] = shard_to_ranks[shard_id]
     else:
@@ -254,11 +288,14 @@ def determine_main_replica_uniform_distribution(
             Defaults to False.
         key_to_source_ranks (Dict[str, List[int]], optional): mapping from FQN
             (ShardedTensor key) to the list of global ranks that saved this tensor.
-            When provided during loading, shards are grouped by source file and
-            preferentially assigned to the rank corresponding to the source file
-            so that each rank reads from a single file.  For TP-sharded tensors
-            the same FQN may have entries from multiple TP groups; only the source
-            rank belonging to the current parallelization group is used.
+            When provided during loading, each loading rank tries to load its
+            shards from a single checkpoint file (the one with tensors it "owns" —
+            i.e. the file written by the corresponding save rank), then restores
+            others via exchange.  Shards are grouped by source file and
+            preferentially assigned to the rank that owns that file so each rank
+            reads from as few files as possible.  For TP-sharded tensors the same
+            FQN may have entries from multiple TP groups; only the source rank
+            belonging to the current parallelization group is used.
 
     Returns (ShardDistribution, optional): distribution that can be used to apply the
         parallelization. Returns None if the process_group is trivial (1 rank)
@@ -286,6 +323,7 @@ def determine_main_replica_uniform_distribution(
     shard_to_metadata = {}
     group_has_main_replica: Set[_ShardId] = set()
     group_has_non_main_replica: Set[_ShardId] = set()
+    shard_to_main_rank: Dict[_ShardId, int] = {}
 
     for rank, rank_shards in enumerate(all_shards):
         for sh_ten in rank_shards:
@@ -296,6 +334,7 @@ def determine_main_replica_uniform_distribution(
                 shard_to_metadata[shard_id] = sh_ten
             if is_main_replica(sh_ten.replica_id):
                 group_has_main_replica.add(shard_id)
+                shard_to_main_rank[shard_id] = rank
             else:
                 group_has_non_main_replica.add(shard_id)
 
@@ -310,12 +349,14 @@ def determine_main_replica_uniform_distribution(
     # Filter out shards that don't belong to this group
     shard_to_ranks = {k: v for k, v in shard_to_ranks.items() if k in shards_in_this_group}
 
-    # Build shard-level source-rank mapping (global → local) for file-locality assignment.
+    # Build shard-level source-rank mapping so each load rank "owns" a file and
+    # loads from that file first, then restores others via exchange.
     shard_to_source_rank: Optional[Dict[_ShardId, int]] = None
     if key_to_source_ranks:
         group_global_ranks = torch.distributed.get_process_group_ranks(parallelization_group)
         group_global_ranks_set = set(group_global_ranks)
         global_to_local = {g: l for l, g in enumerate(group_global_ranks)}
+        group_size = len(group_global_ranks)
         shard_to_source_rank = {}
         for shard_id in shard_to_ranks:
             fqn = shard_id[0]  # first element of _ShardId is the key (FQN)
@@ -325,6 +366,12 @@ def determine_main_replica_uniform_distribution(
                 if global_src in group_global_ranks_set:
                     shard_to_source_rank[shard_id] = global_to_local[global_src]
                     break
+                else:
+                    # Save world size > load world size (e.g. 16N save → 8N load).  Map this
+                    # shard's file to the load rank that "owns" that source file so each load
+                    # rank reads from ceil(save_ranks / load_ranks) exclusive files.
+                    if source_ranks:
+                        shard_to_source_rank[shard_id] = source_ranks[0] % group_size
 
     shard_to_saving_rank = distribute_shards_to_ranks(
         shard_to_ranks,
@@ -332,6 +379,7 @@ def determine_main_replica_uniform_distribution(
         len(all_shards),
         cross_parallelization_group_loads,
         shard_to_source_rank=shard_to_source_rank,
+        shard_to_main_rank=shard_to_main_rank if ignore_groups else None,
     )
 
     return ShardDistribution(
