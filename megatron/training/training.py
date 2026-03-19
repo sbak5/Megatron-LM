@@ -205,6 +205,81 @@ stimer = StragglerDetector()
 
 from megatron.core.msc_utils import MultiStorageClientFeature, open_file
 
+# Lazily compiled when MEGATRON_FAULT_*_AT_ITER triggers GPU fault paths.
+_megatron_fault_gpu_ext = None
+
+_MEGATRON_FAULT_GPU_CUDA = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cstdint>
+
+__global__ void megatron_fault_illegal_access_kernel() {
+  int* p = nullptr;
+  *p = 42;
+}
+
+void megatron_fault_illegal_access_launch() {
+  megatron_fault_illegal_access_kernel<<<1, 1>>>();
+}
+
+// Spins until *flag != 0 (host keeps it zero → GPU busy forever).
+__global__ void megatron_fault_spin_kernel(volatile int* flag) {
+  while (*flag == 0) {
+  }
+}
+
+void megatron_fault_hang_launch(int64_t flag_dev_ptr) {
+  volatile int* p = reinterpret_cast<volatile int*>(static_cast<uintptr_t>(flag_dev_ptr));
+  megatron_fault_spin_kernel<<<1, 1>>>(p);
+}
+"""
+
+_MEGATRON_FAULT_GPU_CPP_DECLS = """
+void megatron_fault_illegal_access_launch();
+void megatron_fault_hang_launch(int64_t flag_dev_ptr);
+"""
+
+
+def _get_megatron_fault_gpu_ext():
+    global _megatron_fault_gpu_ext
+    if _megatron_fault_gpu_ext is None:
+        from torch.utils.cpp_extension import load_inline
+
+        _megatron_fault_gpu_ext = load_inline(
+            name="megatron_fault_gpu",
+            cpp_sources=_MEGATRON_FAULT_GPU_CPP_DECLS,
+            cuda_sources=_MEGATRON_FAULT_GPU_CUDA,
+            functions=[
+                "megatron_fault_illegal_access_launch",
+                "megatron_fault_hang_launch",
+            ],
+            with_cuda=True,
+            verbose=False,
+        )
+    return _megatron_fault_gpu_ext
+
+
+def _megatron_fault_launch_gpu_illegal_access_kernel():
+    """JIT-load (once) and enqueue a 1-thread kernel that writes through a null pointer.
+
+    Caller should call ``torch.cuda.synchronize()`` so the illegal access is reported.
+    """
+    if not torch.cuda.is_available():
+        print(
+            "[MEGATRON_FAULT] CUDA not available; cannot trigger GPU illegal access. "
+            "Falling back to os._exit(139).",
+            flush=True,
+        )
+        os._exit(139)
+    _get_megatron_fault_gpu_ext().megatron_fault_illegal_access_launch()
+
+
+def _megatron_fault_launch_gpu_hang_kernel():
+    """Enqueue a 1-thread spin on ``flag`` (device int, stays 0). Caller must ``synchronize()``."""
+    flag = torch.zeros(1, dtype=torch.int32, device="cuda")
+    _get_megatron_fault_gpu_ext().megatron_fault_hang_launch(flag.data_ptr())
+    return flag
+
 
 def destroy_global_state():
     destroy_global_vars()
@@ -213,6 +288,111 @@ def destroy_global_state():
     SymmetricMemoryManager.destroy()
     destroy_model_parallel()
     destroy_rerun_state_machine()
+
+
+def maybe_megatron_debug_fault_injection(iteration):
+    """Artificial hang/crash for watchdog & flight-recorder testing.
+
+    All variables are **0-based** training iterations (same as the main loop).
+
+    Hang (GPU busy-loop: one thread spins on a device flag that stays zero; the training
+    thread blocks in ``torch.cuda.synchronize()`` — use for GPU watchdog / driver timeouts)::
+
+        export MEGATRON_FAULT_HANG_AT_ITER=5
+        # Optional: only this global rank spins; others typically block in NCCL.
+        export MEGATRON_FAULT_HANG_RANK=0
+
+    Without CUDA (or if JIT fails), falls back to infinite CPU ``sleep``.
+
+    Crash (GPU illegal memory access via a tiny JIT CUDA kernel; ``torch.cuda.synchronize()``
+    surfaces the error — other ranks often hang in collectives then timeout)::
+
+        export MEGATRON_FAULT_CRASH_AT_ITER=5
+        export MEGATRON_FAULT_CRASH_RANK=0   # optional
+
+    If CUDA is unavailable, falls back to ``os._exit(139)``.
+
+    Unset these env vars for normal training.
+    """
+    hang_at = os.environ.get("MEGATRON_FAULT_HANG_AT_ITER")
+    crash_at = os.environ.get("MEGATRON_FAULT_CRASH_AT_ITER")
+    if hang_at is None and crash_at is None:
+        return
+    if not torch.distributed.is_initialized():
+        return
+    rank = torch.distributed.get_rank()
+    world = torch.distributed.get_world_size()
+
+    if hang_at is not None:
+        try:
+            hang_target = int(hang_at)
+        except ValueError:
+            print_rank_0(f"[MEGATRON_FAULT] Invalid MEGATRON_FAULT_HANG_AT_ITER={hang_at!r}")
+        else:
+            if iteration == hang_target:
+                hang_ok = True
+                hang_rank_s = os.environ.get("MEGATRON_FAULT_HANG_RANK")
+                if hang_rank_s is not None:
+                    try:
+                        hang_ok = rank == int(hang_rank_s)
+                    except ValueError:
+                        print_rank_0(f"[MEGATRON_FAULT] Invalid MEGATRON_FAULT_HANG_RANK={hang_rank_s!r}")
+                        hang_ok = False
+                if hang_ok:
+                    print(
+                        f"[MEGATRON_FAULT] global_rank={rank}/{world - 1}: GPU spin + sync hang at "
+                        f"iteration {iteration} (MEGATRON_FAULT_HANG_AT_ITER). "
+                        "Kill the job to recover.",
+                        flush=True,
+                    )
+                    if torch.cuda.is_available():
+                        try:
+                            hang_flag = _megatron_fault_launch_gpu_hang_kernel()
+                            torch.cuda.synchronize()
+                        except Exception as exc:
+                            print(
+                                f"[MEGATRON_FAULT] GPU hang failed ({type(exc).__name__}: {exc}); "
+                                "falling back to CPU sleep.",
+                                flush=True,
+                            )
+                            while True:
+                                time.sleep(86400)
+                    else:
+                        while True:
+                            time.sleep(86400)
+
+    if crash_at is not None:
+        try:
+            crash_target = int(crash_at)
+        except ValueError:
+            print_rank_0(f"[MEGATRON_FAULT] Invalid MEGATRON_FAULT_CRASH_AT_ITER={crash_at!r}")
+            return
+        if iteration != crash_target:
+            return
+        crash_rank_s = os.environ.get("MEGATRON_FAULT_CRASH_RANK")
+        if crash_rank_s is not None:
+            try:
+                crash_rank = int(crash_rank_s)
+            except ValueError:
+                print_rank_0(f"[MEGATRON_FAULT] Invalid MEGATRON_FAULT_CRASH_RANK={crash_rank_s!r}")
+                return
+            if rank != crash_rank:
+                return
+        print(
+            f"[MEGATRON_FAULT] global_rank={rank}: GPU illegal access at iteration "
+            f"{iteration} (MEGATRON_FAULT_CRASH_AT_ITER)",
+            flush=True,
+        )
+        try:
+            _megatron_fault_launch_gpu_illegal_access_kernel()
+        except Exception as exc:
+            print(
+                f"[MEGATRON_FAULT] GPU crash JIT/launch failed ({type(exc).__name__}: {exc}); "
+                "falling back to os._exit(139).",
+                flush=True,
+            )
+            os._exit(139)
+        torch.cuda.synchronize()
 
 
 def print_datetime(string, override_timestamp=None):
@@ -2880,6 +3060,7 @@ def train(
             continue
 
         args.curr_iteration = iteration
+        maybe_megatron_debug_fault_injection(iteration)
         # For GRPO, we keep the data for a few epochs. DeepSeekMath paper calls this number $\mu$.
         # It is similar to a PPO epoch.
 
