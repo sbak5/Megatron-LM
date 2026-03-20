@@ -77,6 +77,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_experimental_args(parser)
     parser = _add_one_logger_args(parser)
     parser = _add_inprocess_restart_args(parser)
+    parser = _add_debug_fault_injection_args(parser)
     parser = _add_ft_package_args(parser)
     parser = _add_rerun_machine_args(parser)
     parser = _add_msc_args(parser)
@@ -2092,6 +2093,40 @@ def _add_inprocess_restart_args(parser):
     group.add_argument('--inprocess-empty-cuda-cache', action='store_true',
                        help='Release all unoccupied cached GPU memory on every in-process restart.')
     return parser
+
+
+def _add_debug_fault_injection_args(parser):
+    group = parser.add_argument_group(title='debug fault injection')
+    group.add_argument(
+        '--megatron-fault-hang-at-iter',
+        type=int,
+        default=None,
+        help='0-based training iteration at which the chosen rank(s) enter a GPU busy-loop hang '
+        '(overrides MEGATRON_FAULT_HANG_AT_ITER). For resiliency / watchdog testing only.',
+    )
+    group.add_argument(
+        '--megatron-fault-hang-rank',
+        type=int,
+        default=None,
+        help='Global rank that hangs when --megatron-fault-hang-at-iter is set; omit for all ranks. '
+        'Overrides MEGATRON_FAULT_HANG_RANK.',
+    )
+    group.add_argument(
+        '--megatron-fault-crash-at-iter',
+        type=int,
+        default=None,
+        help='0-based iteration for a JIT GPU illegal-access fault on the chosen rank(s) '
+        '(overrides MEGATRON_FAULT_CRASH_AT_ITER).',
+    )
+    group.add_argument(
+        '--megatron-fault-crash-rank',
+        type=int,
+        default=None,
+        help='Global rank for crash when --megatron-fault-crash-at-iter is set; omit for all ranks. '
+        'Overrides MEGATRON_FAULT_CRASH_RANK.',
+    )
+    return parser
+
 
 def _add_one_logger_args(parser):
     group = parser.add_argument_group(title='one logger')
