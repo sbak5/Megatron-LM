@@ -2098,32 +2098,26 @@ def _add_inprocess_restart_args(parser):
 def _add_debug_fault_injection_args(parser):
     group = parser.add_argument_group(title='debug fault injection')
     group.add_argument(
-        '--megatron-fault-hang-at-iter',
-        type=int,
+        '--megatron-fault-type',
+        type=str,
         default=None,
-        help='0-based training iteration at which the chosen rank(s) enter a GPU busy-loop hang '
-        '(overrides MEGATRON_FAULT_HANG_AT_ITER). For resiliency / watchdog testing only.',
+        help='nvidia-resiliency-ext Fault type to inject (e.g. GPU_SLEEP, GPU_ERROR, SEGFAULT, '
+        'SIGKILL, SIGTERM, OS_ABORT, ASYNC_EXC, WORKLOAD_EXC, LOCK_GIL). '
+        'Overrides MEGATRON_FAULT_TYPE. For resiliency / watchdog testing only.',
     )
     group.add_argument(
-        '--megatron-fault-hang-rank',
+        '--megatron-fault-at-iter',
         type=int,
         default=None,
-        help='Global rank that hangs when --megatron-fault-hang-at-iter is set; omit for all ranks. '
-        'Overrides MEGATRON_FAULT_HANG_RANK.',
+        help='0-based training iteration at which the fault is injected. '
+        'Overrides MEGATRON_FAULT_AT_ITER.',
     )
     group.add_argument(
-        '--megatron-fault-crash-at-iter',
+        '--megatron-fault-rank',
         type=int,
         default=None,
-        help='0-based iteration for a JIT GPU illegal-access fault on the chosen rank(s) '
-        '(overrides MEGATRON_FAULT_CRASH_AT_ITER).',
-    )
-    group.add_argument(
-        '--megatron-fault-crash-rank',
-        type=int,
-        default=None,
-        help='Global rank for crash when --megatron-fault-crash-at-iter is set; omit for all ranks. '
-        'Overrides MEGATRON_FAULT_CRASH_RANK.',
+        help='Global rank to inject the fault on; omit to inject on all ranks. '
+        'Overrides MEGATRON_FAULT_RANK.',
     )
     return parser
 
