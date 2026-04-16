@@ -282,6 +282,102 @@ def _initialize_tp_communicators():
         )
 
 
+def _install_fr_sigabrt_handler() -> None:
+    """Install a C-level SIGABRT handler via sigaction() that dumps the flight
+    recorder before dying.
+
+    Using sigaction() directly (via ctypes) instead of Python's signal.signal()
+    ensures the handler fires synchronously in whichever thread receives SIGABRT
+    — including background C++ threads (NCCL watchdog, PyTorch internals) where
+    Python's deferred signal dispatch never runs.
+
+    Reads the dump path and knobs from the environment variables that Megatron
+    already configured (TORCH_FR_DUMP_TEMP_FILE, TORCH_INCLUDE_STACK_TRACE,
+    TORCH_INCLUDE_ONLY_ACTIVE), so the dump lands in the same location and uses
+    the same settings as the normal watchdog timeout dumps.
+
+    Only installed when flight-recorder-dump-path is set (caller's responsibility).
+    Chains to any previously installed SIGABRT handler so PyTorch/NCCL's own
+    handling is preserved.
+    """
+    import ctypes
+    import ctypes.util
+    import signal
+
+    try:
+        from torch._C._distributed_c10d import _dump_fr_trace
+    except ImportError:
+        warn_rank_0("Flight recorder: _dump_fr_trace not available; SIGABRT handler not installed.")
+        return
+
+    _libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
+
+    # Linux x86_64 struct sigaction layout:
+    #   sa_handler  : void (*)(int)   — 8 bytes
+    #   sa_flags    : unsigned long   — 8 bytes
+    #   sa_restorer : void (*)()      — 8 bytes (kernel-internal, set to NULL)
+    #   sa_mask     : sigset_t        — 128 bytes (1024-bit signal mask)
+    _SigHandler = ctypes.CFUNCTYPE(None, ctypes.c_int)
+
+    class _SigSet(ctypes.Structure):
+        _fields_ = [('val', ctypes.c_ulong * 16)]  # 128 bytes
+
+    class _Sigaction(ctypes.Structure):
+        _fields_ = [
+            ('sa_handler',  ctypes.c_void_p),
+            ('sa_flags',    ctypes.c_ulong),
+            ('sa_restorer', ctypes.c_void_p),
+            ('sa_mask',     _SigSet),
+        ]
+
+    _sigaction_fn = _libc.sigaction
+    _sigaction_fn.argtypes = [ctypes.c_int, ctypes.POINTER(_Sigaction), ctypes.POINTER(_Sigaction)]
+    _sigaction_fn.restype  = ctypes.c_int
+
+    # _prev_sa is allocated before _c_handler so the closure captures the
+    # object reference.  sigaction() fills it in-place when we install, so
+    # by the time SIGABRT fires _c_handler will see the correct old handler.
+    _prev_sa = _Sigaction()
+
+    @_SigHandler
+    def _c_handler(signum):
+        # Dump FR using path and knobs Megatron already configured.
+        # ctypes CFUNCTYPE callbacks acquire the GIL before calling Python,
+        # so _dump_fr_trace and open() are safe to call here.
+        dump_prefix = os.environ.get('TORCH_FR_DUMP_TEMP_FILE', '')
+        if dump_prefix:
+            try:
+                rank          = int(os.environ.get('RANK', 0))
+                include_stack = os.environ.get('TORCH_INCLUDE_STACK_TRACE', '1') == '1'
+                only_active   = os.environ.get('TORCH_INCLUDE_ONLY_ACTIVE',  '0') == '1'
+                data = _dump_fr_trace(
+                    includeStackTraces=include_stack,
+                    onlyActive=only_active,
+                )
+                with open(f'{dump_prefix}{rank}', 'wb') as f:
+                    f.write(data)
+            except Exception:
+                pass
+        # Restore the previous handler and re-deliver so the normal
+        # abort/core-dump path still runs.
+        _sigaction_fn(signal.SIGABRT, ctypes.byref(_prev_sa), None)
+        os.kill(os.getpid(), signal.SIGABRT)
+
+    new_sa = _Sigaction()
+    new_sa.sa_handler = ctypes.cast(_c_handler, ctypes.c_void_p)
+    new_sa.sa_flags   = 0
+    # Single sigaction() call: atomically installs new_sa and captures the
+    # previously installed handler into _prev_sa for chaining.
+    if _sigaction_fn(signal.SIGABRT, ctypes.byref(new_sa), ctypes.byref(_prev_sa)) != 0:
+        warn_rank_0("Flight recorder: sigaction() failed; SIGABRT handler not installed.")
+        return
+
+    # Keep Python objects alive for the process lifetime — the C handler holds
+    # a raw function pointer into them so they must not be GC'd.
+    _install_fr_sigabrt_handler._c_handler_ref = _c_handler
+    _install_fr_sigabrt_handler._prev_sa_ref   = _prev_sa
+
+
 def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, store):
     """Initialize torch.distributed and core model parallel."""
     args = get_args()
@@ -349,6 +445,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 "Flight recorder env vars:\n"
                 + "\n".join(f"  {k}={os.environ[k]}" for k in _fr_env_defaults)
             )
+            _install_fr_sigabrt_handler()
 
         # Call the init process
         init_process_group_kwargs = {
